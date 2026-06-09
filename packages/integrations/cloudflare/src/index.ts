@@ -1,5 +1,5 @@
 import { createReadStream, existsSync, readFileSync } from 'node:fs';
-import { appendFile, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { appendFile, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizePath } from 'vite';
@@ -7,7 +7,7 @@ import { createInterface } from 'node:readline/promises';
 import { removeLeadingForwardSlash } from '@astrojs/internal-helpers/path';
 import { createRedirectsFromAstroRoutes, printAsRedirects } from '@astrojs/underscore-redirects';
 import { cloudflare as cfVitePlugin, type PluginConfig } from '@cloudflare/vite-plugin';
-import type { AstroConfig, AstroIntegration, IntegrationResolvedRoute } from 'astro';
+import type { AstroConfig, AstroIntegration, AstroIntegrationLogger, IntegrationResolvedRoute } from 'astro';
 import { astroFrontmatterScanPlugin } from './esbuild-plugin-astro-frontmatter.js';
 import { getParts } from './utils/generate-routes-json.js';
 import {
@@ -112,6 +112,88 @@ export interface Options
 		NonNullable<PluginConfig['experimental']>,
 		'headersAndRedirectsDevModeSupport'
 	>;
+}
+
+/**
+ * Prepends a `Cache-Control: public, max-age=31536000, immutable` rule for
+ * the hashed `_astro/*` assets to the Cloudflare `_headers` file.
+ *
+ * Skips when:
+ * - `build.assetsPrefix` is set (assets served from an external CDN).
+ * - The user's `_headers` already contains a `Cache-Control` directive
+ *   inside a rule that matches the `_astro/*` path.
+ *
+ * Uses a temp-file + atomic rename so a crash mid-write cannot corrupt
+ * the user's existing `_headers` file.
+ */
+async function prependCacheControlForAssets(
+	clientDir: URL,
+	assetsDirName: string,
+	base: string,
+	assetsPrefix: string | ((...args: any[]) => any) | undefined,
+	logger: AstroIntegrationLogger,
+) {
+	// Skip when assets are served from an external CDN.
+	if (assetsPrefix) return;
+
+	// Build the URL pattern respecting the base path.
+	// Astro's default assets dir is "_astro"; the URL in _headers must match
+	// what the browser requests, i.e. the base-prefixed path.
+	const baseNoTrailing = base === '/' ? '' : base.replace(/\/$/, '');
+	const assetsPattern = `${baseNoTrailing}/${assetsDirName}/*`;
+
+	const headersPath = new URL('./_headers', clientDir);
+
+	// Check if user already has a Cache-Control rule for _astro/*
+	let existingContent = '';
+	try {
+		existingContent = await readFile(headersPath, 'utf-8');
+	} catch {
+		// File does not exist yet — that's fine, we'll create it.
+	}
+
+	if (existingContent) {
+		const lines = existingContent.split('\n');
+		let inAssetsRule = false;
+
+		for (const line of lines) {
+			const trimmed = line.trim();
+			// A non-empty, non-indented, non-comment line starts a new rule.
+			if (trimmed && !line.startsWith(' ') && !line.startsWith('\t') && !trimmed.startsWith('#')) {
+				inAssetsRule = trimmed === assetsPattern;
+			} else if (
+				inAssetsRule &&
+				/^\s+Cache-Control:/i.test(line)
+			) {
+				// User already defined a Cache-Control for the assets path — skip.
+				return;
+			}
+		}
+	}
+
+	const newRule =
+		`${assetsPattern}\n` +
+		`  Cache-Control: public, max-age=31536000, immutable\n`;
+
+	const newContent = existingContent ? newRule + '\n' + existingContent : newRule;
+
+	// Atomic write: write to a temp file in the same directory as the target,
+	// then rename. Using the same directory guarantees the rename is atomic
+	// (same filesystem), so a crash mid-write cannot corrupt the existing file.
+	const tmpPath = new URL('./_headers.tmp.' + process.pid, clientDir);
+
+	try {
+		await writeFile(tmpPath, newContent, 'utf-8');
+		await rename(tmpPath, headersPath);
+	} catch {
+		logger.warn('Failed to write _headers file with cache rule.');
+		// Clean up temp file if rename failed
+		try {
+			await unlink(tmpPath);
+		} catch {
+			// Temp file may not exist
+		}
+	}
 }
 
 export default function createIntegration({
@@ -528,6 +610,20 @@ export default function createIntegration({
 						// wrangler.json may not exist or may contain invalid JSON
 					}
 				}
+
+				// Inject Cache-Control: immutable for hashed _astro/* assets so
+				// browsers cache them forever. Safe to skip when:
+				// - assetsPrefix is set (assets live on an external CDN), or
+				// - the user already defined a Cache-Control rule for _astro/*.
+				await prependCacheControlForAssets(
+					_originalClientDir,
+					_config.build.assets ?? '_astro',
+					_config.base,
+					typeof _config.build.assetsPrefix === 'string'
+						? _config.build.assetsPrefix
+						: undefined,
+					logger,
+				);
 
 				let redirectsExists = false;
 				try {

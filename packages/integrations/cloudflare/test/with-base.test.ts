@@ -75,6 +75,34 @@ describe('base', () => {
 		);
 	});
 
+	it('prepends Cache-Control rule for _astro/* with base path in _headers', async () => {
+		const content = await fixture.readFile('client/_headers');
+		// The rule must use the base-prefixed path, not just /_astro/*
+		assert.match(
+			content,
+			/^\/blog\/_astro\/\*/m,
+			'_headers should start with a rule for /blog/_astro/*',
+		);
+		assert.match(
+			content,
+			/Cache-Control:\s*public,\s*max-age=31536000,\s*immutable/,
+			'_headers should contain the immutable Cache-Control rule',
+		);
+		// The user's original rule must still be present
+		assert.match(
+			content,
+			/X-Custom-Header:\s*67/,
+			'User-defined headers must be preserved',
+		);
+		// The cache-control rule must come before the user's rules (prepended)
+		const cacheIdx = content.indexOf('Cache-Control:');
+		const customIdx = content.indexOf('X-Custom-Header:');
+		assert.ok(
+			cacheIdx < customIdx,
+			'Cache-Control rule must be prepended before user-defined rules',
+		);
+	});
+
 	it('sets assets.directory to the un-prefixed client root in wrangler.json', async () => {
 		const raw = await fixture.readFile('server/wrangler.json');
 		const config = JSON.parse(raw);
