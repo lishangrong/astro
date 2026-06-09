@@ -529,6 +529,33 @@ export default function createIntegration({
 					}
 				}
 
+				// Generate Cache-Control headers for hashed static assets.
+				// Skip when assets are served from an external CDN (assetsPrefix).
+				if (!_config.build.assetsPrefix) {
+					const assetsPath = `${_config.base}${_config.build.assets}/*`;
+					const headersUrl = new URL('./_headers', _originalClientDir);
+					let existingHeaders = '';
+					try {
+						existingHeaders = await readFile(headersUrl, 'utf-8');
+					} catch {
+						// File doesn't exist yet — that's fine
+					}
+
+					const hasExistingCacheRule =
+						existingHeaders.includes(`${_config.build.assets}/*`) &&
+						existingHeaders.includes('Cache-Control');
+
+					if (!hasExistingCacheRule) {
+						const cacheRule = `${assetsPath}\n  Cache-Control: public, max-age=31536000, immutable\n`;
+						const newContent = existingHeaders
+							? `${cacheRule}\n${existingHeaders}`
+							: cacheRule;
+						const tmpUrl = new URL('./_headers.tmp', _originalClientDir);
+						await writeFile(tmpUrl, newContent);
+						await rename(tmpUrl, headersUrl);
+					}
+				}
+
 				let redirectsExists = false;
 				try {
 					const redirectsStat = await stat(new URL('./_redirects', _originalClientDir));

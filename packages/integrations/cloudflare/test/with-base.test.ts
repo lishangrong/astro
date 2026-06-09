@@ -75,6 +75,23 @@ describe('base', () => {
 		);
 	});
 
+	it('prepends Cache-Control header for hashed assets', async () => {
+		const content = await fixture.readFile('client/_headers');
+		assert.match(content, /\/blog\/_astro\/\*\n\s+Cache-Control: public, max-age=31536000, immutable/);
+	});
+
+	it('preserves user-defined headers', async () => {
+		const content = await fixture.readFile('client/_headers');
+		assert.ok(content.includes('X-Custom-Header: 67'));
+	});
+
+	it('places cache rule before user headers', async () => {
+		const content = await fixture.readFile('client/_headers');
+		const cacheIndex = content.indexOf('Cache-Control');
+		const userIndex = content.indexOf('X-Custom-Header');
+		assert.ok(cacheIndex < userIndex, 'cache rule should precede user headers');
+	});
+
 	it('sets assets.directory to the un-prefixed client root in wrangler.json', async () => {
 		const raw = await fixture.readFile('server/wrangler.json');
 		const config = JSON.parse(raw);
